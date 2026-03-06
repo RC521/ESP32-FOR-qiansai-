@@ -71,6 +71,7 @@ private:
         ESP_LOGW(TAG, "检测指令：%s", cmd);
 
         uint8_t data[64];
+        memset(data, 0, sizeof(data)); // 初始化接收缓冲区
 
         // ===== 最多尝试 6 次 =====
         for (int attempt = 1; attempt <= 6; attempt++) {
@@ -95,14 +96,25 @@ private:
                     pdMS_TO_TICKS(100)
                 );
 
-            // 只要前两个字符是 R1 就判定成功
-            if (len >= 2 &&
-                data[0] == cmd[0] &&
-                data[1] == cmd[1]) {
+                if (len > 0) {
+                    data[len] = '\0'; // 确保字符串以'\0'结尾
+                    std::string recv_data((char*)data);
+                    ESP_LOGW(TAG, "收到返回数据：%s", recv_data.c_str());
 
-                ESP_LOGW(TAG, "匹配成功");
-                return "{\"结果\":\"成功\",\"播报\":\"已稳定识别到目标\"}";
-            }
+                    // 1. 检测是否返回 no/NO（不区分大小写）
+                    std::string recv_lower = recv_data;
+                    std::transform(recv_lower.begin(), recv_lower.end(), recv_lower.begin(), ::tolower);
+                    if (recv_lower.find("no") != std::string::npos) {
+                        ESP_LOGW(TAG, "检测到返回no，未识别到目标");
+                        return "{\"结果\":\"失败\",\"播报\":\"未识别到目标\"}";
+                    }
+
+                    // 2. 原逻辑：前两个字符匹配则判定成功
+                    if (len >= 2 && data[0] == cmd[0] && data[1] == cmd[1]) {
+                        ESP_LOGW(TAG, "匹配成功");
+                        return "{\"结果\":\"成功\",\"播报\":\"已稳定识别到目标\"}";
+                    }
+                }
 
                 elapsed += 100;
             }
@@ -111,6 +123,93 @@ private:
         ESP_LOGW(TAG, "6 次检测均失败");
         return "{\"结果\":\"失败\",\"播报\":\"检测超时，未识别到目标\"}";
     }
+
+
+    // ===== 新增：机械臂移动核心函数 =====
+    std::string detect_move(char color_code, const PropertyList& args) {
+
+        std::string location;
+
+        try {
+            location = args["location"].value<std::string>();
+        } catch (...) {
+            try {
+                location = std::to_string(args["location"].value<int>());
+            } catch (...) {
+                location = "";
+            }
+        }
+
+        char loc_code = parse_location(location);
+
+        ESP_LOGW(
+            TAG,
+            "移动解析结果：color=%c , location='%s' → %c",
+            color_code, location.c_str(), loc_code
+        );
+
+        if (loc_code == 'X') {
+            return "{\"结果\":\"失败\",\"播报\":\"位置不明确，无法移动\"}";
+        }
+
+        // ===== 构造机械臂移动指令（颜色 + 位置 + M）=====
+        char cmd[8];
+        snprintf(cmd, sizeof(cmd), "%c%cM\n", color_code, loc_code); // 指令格式如 R1M、G2M、B3M
+
+        ESP_LOGW(TAG, "机械臂移动指令：%s", cmd);
+
+        uint8_t data[64];
+        memset(data, 0, sizeof(data));
+
+        // ===== 最多尝试 3 次移动指令 =====
+        for (int attempt = 1; attempt <= 3; attempt++) {
+
+            ESP_LOGW(TAG, "第 %d / 3 次发送移动指令", attempt);
+
+            uart_flush_input(uart_num_); // 清空接收缓冲区
+            uart_write_bytes(uart_num_, cmd, strlen(cmd)); // 发送移动指令
+
+            int elapsed = 0;
+            const int timeout_ms = 1000; // 移动指令超时时间更长（1秒）
+
+            while (elapsed < timeout_ms) {
+
+                int len = uart_read_bytes(
+                    uart_num_,
+                    data,
+                    sizeof(data) - 1,
+                    pdMS_TO_TICKS(100)
+                );
+
+                if (len > 0) {
+                    data[len] = '\0';
+                    std::string recv_data((char*)data);
+                    ESP_LOGW(TAG, "移动指令返回数据：%s", recv_data.c_str());
+
+                    // 判定移动成功（可根据OpenMV/机械臂实际返回值调整，比如"ok"/"success"）
+                    std::string recv_lower = recv_data;
+                    std::transform(recv_lower.begin(), recv_lower.end(), recv_lower.begin(), ::tolower);
+                    if (recv_lower.find("ok") != std::string::npos || recv_lower.find("success") != std::string::npos) {
+                        ESP_LOGW(TAG, "机械臂移动成功");
+                        return "{\"结果\":\"成功\",\"播报\":\"已将指定位置的目标移动至指定位置\"}";
+                    }
+
+                    // 检测到no，说明移动目标未识别，移动失败
+                    if (recv_lower.find("no") != std::string::npos) {
+                        ESP_LOGW(TAG, "移动目标未识别，移动失败");
+                        return "{\"结果\":\"失败\",\"播报\":\"未识别到移动目标，移动失败\"}";
+                    }
+                }
+
+                elapsed += 100;
+            }
+        }
+
+        ESP_LOGW(TAG, "移动指令发送失败");
+        return "{\"结果\":\"失败\",\"播报\":\"移动指令超时，机械臂未响应\"}";
+    }
+
+
 
 public:
     explicit Uart_Detector(uart_port_t uart_num = UART_NUM)
@@ -171,6 +270,38 @@ public:
                 return detect('G', args);
             }
         );
+
+        // ===== 新增：机械臂移动功能 =====
+        // 移动红色方块
+        server.AddTool(
+            "视觉检测.移动红色方块",
+            "将指定位置的红色方块移动至指定位置",
+            PropertyList(props),
+            [this](const PropertyList& args) {
+                return detect_move('R', args);
+            }
+        );
+
+        // 移动蓝色方块
+        server.AddTool(
+            "视觉检测.移动蓝色方块",
+            "将指定位置的蓝色方块移动至指定位置",
+            PropertyList(props),
+            [this](const PropertyList& args) {
+                return detect_move('B', args);
+            }
+        );
+
+        // 移动绿色方块
+        server.AddTool(
+            "视觉检测.移动绿色方块",
+            "将指定位置的绿色方块移动至指定位置",
+            PropertyList(props),
+            [this](const PropertyList& args) {
+                return detect_move('G', args);
+            }
+        );
+
     }
 };
 
